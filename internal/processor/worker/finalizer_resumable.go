@@ -47,6 +47,10 @@ import (
 // assembly (keyset pagination by ordinal).
 const resumableEntriesPageSize = 500
 
+// maxFinalizingAttempts bounds the reload-and-swap loop of the finalizing
+// write, matching the API server's cancel path.
+const maxFinalizingAttempts = 3
+
 // finalizeResumableJob finalizes a durable batch: it streams every entry's
 // checkpointed result object into the output and error artifacts and
 // transitions the batch to completed. Both the finalizing and terminal
@@ -58,7 +62,9 @@ const resumableEntriesPageSize = 500
 // error without a fallback terminal write, leaving the row non-terminal so
 // the reconciler requeue retries the finalization under a current lease —
 // an unfenced failed write would discard the checkpointed work and let an
-// owner that lost its lease terminalize the batch anyway.
+// owner that lost its lease terminalize the batch anyway. The finalizing
+// write is a compare-and-swap on the reloaded status, so a concurrent cancel
+// wins and ends the batch as cancelled with its partial results.
 func (p *Processor) finalizeResumableJob(
 	ctx context.Context,
 	updater *StatusUpdater,
@@ -80,8 +86,16 @@ func (p *Processor) finalizeResumableJob(
 
 	// in_progress → finalizing, before artifact assembly so the API server
 	// can reject cancel requests once finalization has begun.
-	if err := updater.UpdatePersistentStatus(ioCtx, dbJob, openai.BatchStatusFinalizing, nil, nil); err != nil {
-		return fmt.Errorf("failed to update job status to finalizing: %w", err)
+	cancelling, err := p.advanceToFinalizing(ioCtx, updater, dbJob)
+	if err != nil {
+		return err
+	}
+	if cancelling {
+		if err := p.finalizeResumableAs(ctx, updater, dbJob, jobInfo, openai.BatchStatusCancelled,
+			batch_types.ErrCodeBatchCancelled, openai.BatchStatusCancelling); err != nil {
+			return fmt.Errorf("finalize cancelling batch: %w", err)
+		}
+		return batchctx.ErrCancelled
 	}
 
 	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo, "")
@@ -118,6 +132,44 @@ func (p *Processor) finalizeResumableJob(
 	setRequestCountAttrs(ctx, counts)
 	logger.V(logging.INFO).Info("Resumable finalization completed", "outputFileID", outputFileID, "errorFileID", errorFileID)
 	return nil
+}
+
+// advanceToFinalizing moves the row from in_progress to finalizing by
+// compare-and-swap on the freshly read status document, and reports whether a
+// concurrent cancel holds the row instead. The in-memory status cannot be the
+// expected value: progress writes change the document in place. A conflict
+// means the row is not this incarnation's to finalize right now; it stays
+// non-terminal for its owner or the reconciler requeue.
+func (p *Processor) advanceToFinalizing(ctx context.Context, updater *StatusUpdater, dbJob *db.BatchItem) (bool, error) {
+	for range maxFinalizingAttempts {
+		items, _, _, err := updater.db.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{dbJob.ID}}}, true, 0, 1)
+		if err != nil {
+			return false, fmt.Errorf("reload before finalizing: %w", err)
+		}
+		if len(items) != 1 || items[0].Epoch != dbJob.Epoch {
+			return false, fmt.Errorf("reload before finalizing: %w", db.ErrConflict)
+		}
+		// BuildStatus starts from this document, so counts and cancelling_at survive.
+		dbJob.Status = items[0].Status
+
+		switch status := p.getJobStatus(items[0]); status {
+		case openai.BatchStatusFinalizing:
+			return false, nil
+		case openai.BatchStatusCancelling:
+			return true, nil
+		case openai.BatchStatusInProgress:
+			err := updater.updatePersistentStatus(ctx, dbJob, openai.BatchStatusFinalizing, nil, nil, items[0].Status)
+			if err == nil {
+				return false, nil
+			}
+			if !errors.Is(err, db.ErrConflict) {
+				return false, fmt.Errorf("failed to update job status to finalizing: %w", err)
+			}
+		default:
+			return false, fmt.Errorf("row is %s, cannot finalize: %w", status, db.ErrConflict)
+		}
+	}
+	return false, fmt.Errorf("finalizing write refused %d times: %w", maxFinalizingAttempts, db.ErrConflict)
 }
 
 // finalizeResumableAs terminalizes a durable batch that must not resume

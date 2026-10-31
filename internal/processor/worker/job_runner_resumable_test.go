@@ -99,6 +99,32 @@ func (r *rowSyncedResumable) FinalizeResumableBatch(ctx context.Context, fin *db
 	return nil
 }
 
+// ActivateResumableBatch mirrors production's activation flip into the row
+// mock: one statement there sets the row in_progress and resumable.
+func (r *rowSyncedResumable) ActivateResumableBatch(ctx context.Context, activation *db.ResumableActivation) error {
+	if err := r.MockResumableStore.ActivateResumableBatch(ctx, activation); err != nil {
+		return err
+	}
+	items, _, _, err := r.rows.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{activation.BatchID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		return fmt.Errorf("mirror activation of %s into row mock: err=%v len=%d", activation.BatchID, err, len(items))
+	}
+	item := *items[0]
+	var status openai.BatchStatusInfo
+	if err := json.Unmarshal(item.Status, &status); err != nil {
+		return fmt.Errorf("mirror activation of %s into row mock: %w", activation.BatchID, err)
+	}
+	status.Status = openai.BatchStatusInProgress
+	if item.Status, err = json.Marshal(status); err != nil {
+		return fmt.Errorf("mirror activation of %s into row mock: %w", activation.BatchID, err)
+	}
+	item.Resumable = true
+	if err := r.rows.DBStore(ctx, &item); err != nil {
+		return fmt.Errorf("mirror activation of %s into row mock: %w", activation.BatchID, err)
+	}
+	return nil
+}
+
 // durableInputLine builds one input line for the given model and custom ID.
 func durableInputLine(model, customID string) string {
 	return fmt.Sprintf(`{"custom_id":%q,"method":"POST","url":"/v1/chat/completions","body":{"model":%q,"messages":[{"role":"user","content":"hi"}]}}`+"\n", customID, model)
@@ -1432,6 +1458,282 @@ func TestFinalizeResumableJob_CancelDuringFinalization(t *testing.T) {
 		if outLines[i].ID != want {
 			t.Fatalf("output line %d id = %s, want %s", i, outLines[i].ID, want)
 		}
+	}
+}
+
+// casObservingDB is the row client handed to the finalizer's status updater.
+// It counts status writes and can move the row at the moment a
+// compare-and-swap is attempted, the window a concurrent writer races into.
+// Artifact assembly and the terminal write go through the real mocks.
+type casObservingDB struct {
+	db.BatchProgressDBClient
+	// beforeCAS runs before a write that carries an expected status, with the
+	// 1-based write attempt.
+	beforeCAS func(attempt int)
+	getErr    error
+	writes    int
+}
+
+var _ db.BatchProgressDBClient = (*casObservingDB)(nil)
+
+func (c *casObservingDB) DBGet(ctx context.Context, query *db.BatchQuery, includeStatic bool, start, limit int) ([]*db.BatchItem, int, bool, error) {
+	if c.getErr != nil {
+		return nil, 0, false, c.getErr
+	}
+	return c.BatchProgressDBClient.DBGet(ctx, query, includeStatic, start, limit)
+}
+
+func (c *casObservingDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
+	c.writes++
+	if expectedStatus != nil && c.beforeCAS != nil {
+		c.beforeCAS(c.writes)
+	}
+	return c.BatchProgressDBClient.DBUpdate(ctx, item, expectedStatus)
+}
+
+// durableRow returns the batch's persisted row.
+func durableRow(t *testing.T, env *durableJobEnv) *db.BatchItem {
+	t.Helper()
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{env.jobItem.ID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", env.jobItem.ID, err, len(items))
+	}
+	return items[0]
+}
+
+// moveRowTo changes the persisted status behind the processor's back: the
+// row is copied so env.jobItem keeps the status it was picked up with, and
+// both mock stores are updated the way production's single row would be.
+func moveRowTo(t *testing.T, env *durableJobEnv, status openai.BatchStatusInfo) {
+	t.Helper()
+	row := *durableRow(t, env)
+	row.Status = mustJSON(t, status)
+	if err := env.dbClient.DBStore(testLoggerCtx(t), &row); err != nil {
+		t.Fatalf("DBStore row: %v", err)
+	}
+	env.resumable.SetBatchStatus(env.jobItem.ID, string(status.Status))
+}
+
+// TestFinalizeResumableJob_ConcurrentCancel verifies that the finalizing
+// write decides on the row's current status, so a cancel that reached the row
+// after this processor last read it is honoured instead of overwritten.
+func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
+	const jobID = "job-resumable-concurrent-cancel"
+
+	cancellingAt := time.Now().Unix()
+	cancellingDoc := openai.BatchStatusInfo{Status: openai.BatchStatusCancelling, CancellingAt: &cancellingAt}
+	finalizingAt := time.Now().Unix()
+	errReload := errors.New("reload failed")
+
+	bumpProgress := func(t *testing.T, env *durableJobEnv, total int64) {
+		t.Helper()
+		err := NewStatusUpdater(env.dbClient).UpdateProgressCounts(testLoggerCtx(t), jobID, 2, &openai.BatchRequestCounts{Total: total})
+		if err != nil {
+			t.Fatalf("UpdateProgressCounts: %v", err)
+		}
+	}
+	isErr := func(target error) func(error) bool {
+		return func(err error) bool { return errors.Is(err, target) }
+	}
+	noErr := func(err error) bool { return err == nil }
+	allCompleted := openai.BatchRequestCounts{Total: 2, Completed: 2}
+
+	tests := []struct {
+		name string
+		// arrange runs after stageFinalizingClaim: an in_progress row at epoch
+		// 2 with both entries checkpointed.
+		arrange          func(t *testing.T, env *durableJobEnv, rows *casObservingDB)
+		wantErr          func(error) bool
+		wantStatus       openai.BatchStatus
+		wantCounts       openai.BatchRequestCounts
+		wantWrites       int
+		wantFinalizingAt bool
+		wantCancellingAt bool
+		wantRowUnchanged bool
+		wantCancelledReq string
+	}{
+		{
+			name:             "row in progress completes",
+			wantErr:          noErr,
+			wantStatus:       openai.BatchStatusCompleted,
+			wantCounts:       allCompleted,
+			wantWrites:       1,
+			wantFinalizingAt: true,
+		},
+		{
+			name: "row cancelling ends cancelled with partial artifacts and never persists finalizing",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				// Re-stage with req-2 unfinished, reusing req-1's stored result.
+				staged, err := env.resumable.ListBatchEntries(testLoggerCtx(t), jobID, -1, 1)
+				if err != nil || len(staged) != 1 {
+					t.Fatalf("ListBatchEntries: err=%v len=%d", err, len(staged))
+				}
+				req1 := staged[0]
+				env.stageResumedClaim(t, 2,
+					db.ResumableActivationEntry{
+						RequestID:    req1.RequestID,
+						Ordinal:      req1.Ordinal,
+						CustomID:     req1.CustomID,
+						Status:       string(req1.Status),
+						ResultKey:    req1.ResultKey,
+						ResultBytes:  req1.ResultBytes,
+						ResultSHA256: req1.ResultSHA256,
+					},
+					pendingLineEntry(jobID, "req-2", 1),
+				)
+				moveRowTo(t, env, cancellingDoc)
+			},
+			wantErr:          isErr(batchctx.ErrCancelled),
+			wantStatus:       openai.BatchStatusCancelled,
+			wantCounts:       openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1},
+			wantCancellingAt: true,
+			wantCancelledReq: "req-2",
+		},
+		{
+			name: "progress written since pickup still completes",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				bumpProgress(t, env, 2)
+			},
+			wantErr:          noErr,
+			wantStatus:       openai.BatchStatusCompleted,
+			wantCounts:       allCompleted,
+			wantWrites:       1,
+			wantFinalizingAt: true,
+		},
+		{
+			name: "row already finalizing completes without a second write",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				moveRowTo(t, env, openai.BatchStatusInfo{Status: openai.BatchStatusFinalizing, FinalizingAt: &finalizingAt})
+			},
+			wantErr:          noErr,
+			wantStatus:       openai.BatchStatusCompleted,
+			wantCounts:       allCompleted,
+			wantFinalizingAt: true,
+		},
+		{
+			name: "moved epoch is a conflict and leaves the row alone",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				row := *durableRow(t, env)
+				row.Epoch = 3
+				if err := env.dbClient.DBStore(testLoggerCtx(t), &row); err != nil {
+					t.Fatalf("DBStore row: %v", err)
+				}
+			},
+			wantErr:          isErr(db.ErrConflict),
+			wantStatus:       openai.BatchStatusInProgress,
+			wantRowUnchanged: true,
+		},
+		{
+			name: "cancel landing between reload and write ends cancelled",
+			arrange: func(t *testing.T, env *durableJobEnv, rows *casObservingDB) {
+				rows.beforeCAS = func(attempt int) {
+					if attempt == 1 {
+						moveRowTo(t, env, cancellingDoc)
+					}
+				}
+			},
+			wantErr:          isErr(batchctx.ErrCancelled),
+			wantStatus:       openai.BatchStatusCancelled,
+			wantCounts:       allCompleted,
+			wantWrites:       1,
+			wantCancellingAt: true,
+		},
+		{
+			name: "progress landing between reload and write retries and completes",
+			arrange: func(t *testing.T, env *durableJobEnv, rows *casObservingDB) {
+				rows.beforeCAS = func(attempt int) {
+					if attempt == 1 {
+						bumpProgress(t, env, 2)
+					}
+				}
+			},
+			wantErr:          noErr,
+			wantStatus:       openai.BatchStatusCompleted,
+			wantCounts:       allCompleted,
+			wantWrites:       2,
+			wantFinalizingAt: true,
+		},
+		{
+			name: "repeated refusal gives up after three attempts without finalizing",
+			arrange: func(t *testing.T, env *durableJobEnv, rows *casObservingDB) {
+				rows.beforeCAS = func(attempt int) { bumpProgress(t, env, int64(attempt)) }
+			},
+			// Any error: the row stays non-terminal for a later retry.
+			wantErr:    func(err error) bool { return err != nil },
+			wantStatus: openai.BatchStatusInProgress,
+			wantWrites: 3,
+		},
+		{
+			name: "terminal row is a conflict and leaves the row alone",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				moveRowTo(t, env, openai.BatchStatusInfo{Status: openai.BatchStatusCompleted})
+			},
+			wantErr:          isErr(db.ErrConflict),
+			wantStatus:       openai.BatchStatusCompleted,
+			wantRowUnchanged: true,
+		},
+		{
+			name: "failed reload leaves the row for the reconciler",
+			arrange: func(_ *testing.T, _ *durableJobEnv, rows *casObservingDB) {
+				rows.getErr = errReload
+			},
+			wantErr: func(err error) bool {
+				return errors.Is(err, errReload) && !errors.Is(err, db.ErrConflict)
+			},
+			wantStatus:       openai.BatchStatusInProgress,
+			wantRowUnchanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+			stageFinalizingClaim(t, env, jobID)
+			rows := &casObservingDB{BatchProgressDBClient: env.dbClient}
+			if tt.arrange != nil {
+				tt.arrange(t, env, rows)
+			}
+			before := durableRow(t, env).Status
+
+			err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(rows), env.jobItem, env.jobInfo)
+			if !tt.wantErr(err) {
+				t.Fatalf("finalizeResumableJob error = %v, unexpected for this case", err)
+			}
+
+			status := durableJobStatus(t, env)
+			if status.Status != tt.wantStatus {
+				t.Fatalf("status = %s, want %s", status.Status, tt.wantStatus)
+			}
+			if rows.writes != tt.wantWrites {
+				t.Errorf("status writes through the updater = %d, want %d", rows.writes, tt.wantWrites)
+			}
+			if tt.wantCounts != (openai.BatchRequestCounts{}) && status.RequestCounts != tt.wantCounts {
+				t.Errorf("counts = %+v, want %+v", status.RequestCounts, tt.wantCounts)
+			}
+			if got := status.FinalizingAt != nil; got != tt.wantFinalizingAt {
+				t.Errorf("finalizing_at set = %v, want %v", got, tt.wantFinalizingAt)
+			}
+			if tt.wantCancellingAt && (status.CancellingAt == nil || *status.CancellingAt != cancellingAt) {
+				t.Errorf("cancelling_at = %v, want %d", status.CancellingAt, cancellingAt)
+			}
+			if tt.wantRowUnchanged && !bytes.Equal(durableRow(t, env).Status, before) {
+				t.Errorf("row status = %s, want unchanged %s", durableRow(t, env).Status, before)
+			}
+			if tt.wantCancelledReq == "" {
+				return
+			}
+			errLines := readArtifactLines(t, env,
+				ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID)))
+			if len(errLines) != 1 || errLines[0].ID != stableBatchRequestID(jobID, tt.wantCancelledReq) ||
+				errLines[0].Error == nil || errLines[0].Error.Code != string(batch_types.ErrCodeBatchCancelled) {
+				t.Errorf("error artifact = %+v, want one %s line for %s", errLines, batch_types.ErrCodeBatchCancelled, tt.wantCancelledReq)
+			}
+			outLines := readArtifactLines(t, env,
+				ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+			if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+				t.Errorf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+			}
+		})
 	}
 }
 
