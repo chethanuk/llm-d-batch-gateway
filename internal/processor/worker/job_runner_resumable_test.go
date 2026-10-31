@@ -1471,6 +1471,9 @@ type casObservingDB struct {
 	// 1-based write attempt.
 	beforeCAS func(attempt int)
 	getErr    error
+	// getEmpty makes the reload find no row.
+	getEmpty  bool
+	updateErr error
 	writes    int
 }
 
@@ -1480,6 +1483,9 @@ func (c *casObservingDB) DBGet(ctx context.Context, query *db.BatchQuery, includ
 	if c.getErr != nil {
 		return nil, 0, false, c.getErr
 	}
+	if c.getEmpty {
+		return nil, 0, false, nil
+	}
 	return c.BatchProgressDBClient.DBGet(ctx, query, includeStatic, start, limit)
 }
 
@@ -1487,6 +1493,9 @@ func (c *casObservingDB) DBUpdate(ctx context.Context, item *db.BatchItem, expec
 	c.writes++
 	if expectedStatus != nil && c.beforeCAS != nil {
 		c.beforeCAS(c.writes)
+	}
+	if c.updateErr != nil {
+		return c.updateErr
 	}
 	return c.BatchProgressDBClient.DBUpdate(ctx, item, expectedStatus)
 }
@@ -1523,7 +1532,10 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 	cancellingAt := time.Now().Unix()
 	cancellingDoc := openai.BatchStatusInfo{Status: openai.BatchStatusCancelling, CancellingAt: &cancellingAt}
 	finalizingAt := time.Now().Unix()
+	// An hour back, so a timestamp stamped during the test cannot match it.
+	inProgressAt := time.Now().Add(-time.Hour).Unix()
 	errReload := errors.New("reload failed")
+	errWrite := errors.New("write failed")
 
 	bumpProgress := func(t *testing.T, env *durableJobEnv, total int64) {
 		t.Helper()
@@ -1536,6 +1548,9 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 		return func(err error) bool { return errors.Is(err, target) }
 	}
 	noErr := func(err error) bool { return err == nil }
+	isErrOnly := func(target, excluded error) func(error) bool {
+		return func(err error) bool { return errors.Is(err, target) && !errors.Is(err, excluded) }
+	}
 	allCompleted := openai.BatchRequestCounts{Total: 2, Completed: 2}
 
 	tests := []struct {
@@ -1551,6 +1566,8 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 		wantCancellingAt bool
 		wantRowUnchanged bool
 		wantCancelledReq string
+		wantInProgressAt bool
+		wantNoArtifacts  bool
 	}{
 		{
 			name:             "row in progress completes",
@@ -1601,6 +1618,19 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 			wantFinalizingAt: true,
 		},
 		{
+			name: "row document fresher than the pickup copy reaches the terminal status",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				// Activation sets in_progress_at on the row only.
+				moveRowTo(t, env, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress, InProgressAt: &inProgressAt})
+			},
+			wantErr:          noErr,
+			wantStatus:       openai.BatchStatusCompleted,
+			wantCounts:       allCompleted,
+			wantWrites:       1,
+			wantFinalizingAt: true,
+			wantInProgressAt: true,
+		},
+		{
 			name: "row already finalizing completes without a second write",
 			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
 				moveRowTo(t, env, openai.BatchStatusInfo{Status: openai.BatchStatusFinalizing, FinalizingAt: &finalizingAt})
@@ -1622,6 +1652,38 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 			wantErr:          isErr(db.ErrConflict),
 			wantStatus:       openai.BatchStatusInProgress,
 			wantRowUnchanged: true,
+			wantNoArtifacts:  true,
+		},
+		{
+			name: "missing row is a conflict and writes nothing",
+			arrange: func(_ *testing.T, _ *durableJobEnv, rows *casObservingDB) {
+				rows.getEmpty = true
+			},
+			wantErr:          isErr(db.ErrConflict),
+			wantStatus:       openai.BatchStatusInProgress,
+			wantRowUnchanged: true,
+			wantNoArtifacts:  true,
+		},
+		{
+			name: "fence refusing the cancelled write is a conflict, not a cancellation",
+			arrange: func(t *testing.T, env *durableJobEnv, _ *casObservingDB) {
+				moveRowTo(t, env, cancellingDoc)
+				env.resumable.SetBatchStatus(jobID, string(openai.BatchStatusCompleted))
+			},
+			wantErr:          isErrOnly(db.ErrConflict, batchctx.ErrCancelled),
+			wantStatus:       openai.BatchStatusCancelling,
+			wantRowUnchanged: true,
+		},
+		{
+			name: "non-conflict write error is returned without a retry",
+			arrange: func(_ *testing.T, _ *durableJobEnv, rows *casObservingDB) {
+				rows.updateErr = errWrite
+			},
+			wantErr:          isErrOnly(errWrite, db.ErrConflict),
+			wantStatus:       openai.BatchStatusInProgress,
+			wantWrites:       1,
+			wantRowUnchanged: true,
+			wantNoArtifacts:  true,
 		},
 		{
 			name: "cancel landing between reload and write ends cancelled",
@@ -1658,8 +1720,7 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 			arrange: func(t *testing.T, env *durableJobEnv, rows *casObservingDB) {
 				rows.beforeCAS = func(attempt int) { bumpProgress(t, env, int64(attempt)) }
 			},
-			// Any error: the row stays non-terminal for a later retry.
-			wantErr:    func(err error) bool { return err != nil },
+			wantErr:    isErr(db.ErrConflict),
 			wantStatus: openai.BatchStatusInProgress,
 			wantWrites: 3,
 		},
@@ -1671,6 +1732,7 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 			wantErr:          isErr(db.ErrConflict),
 			wantStatus:       openai.BatchStatusCompleted,
 			wantRowUnchanged: true,
+			wantNoArtifacts:  true,
 		},
 		{
 			name: "failed reload leaves the row for the reconciler",
@@ -1718,6 +1780,20 @@ func TestFinalizeResumableJob_ConcurrentCancel(t *testing.T) {
 			}
 			if tt.wantRowUnchanged && !bytes.Equal(durableRow(t, env).Status, before) {
 				t.Errorf("row status = %s, want unchanged %s", durableRow(t, env).Status, before)
+			}
+			if tt.wantInProgressAt && (status.InProgressAt == nil || *status.InProgressAt != inProgressAt) {
+				t.Errorf("in_progress_at = %v, want %d", status.InProgressAt, inProgressAt)
+			}
+			if tt.wantNoArtifacts {
+				folder, err := ucom.GetFolderNameByTenantID(env.jobInfo.TenantID)
+				if err != nil {
+					t.Fatalf("GetFolderNameByTenantID: %v", err)
+				}
+				key := ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID))
+				if reader, _, err := env.filesClient.Retrieve(context.Background(), key, folder); err == nil {
+					reader.Close()
+					t.Errorf("output artifact %s exists, want none for a row this processor must not finalize", key)
+				}
 			}
 			if tt.wantCancelledReq == "" {
 				return
