@@ -73,3 +73,25 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+
+  - it: should render the PostgreSQL pool cap when set
+    set:
+      global.dbClient.postgresql.pool.maxConnections: 7
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'db_client:\n\s+type: "postgresql"\n\s+postgresql:\n\s+pool:\n\s+max_connections: 7'
+
+  - it: should omit the PostgreSQL pool block by default
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'postgresql:\n\s+pool:'
+
+  - it: should omit the PostgreSQL pool block when stored values lack the key
+    set:
+      global.dbClient.postgresql: null
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'postgresql:\n\s+pool:'

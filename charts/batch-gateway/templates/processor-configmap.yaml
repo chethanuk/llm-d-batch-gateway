@@ -46,6 +46,11 @@ data:
 
     db_client:
       type: {{ .Values.global.dbClient.type | quote }}
+      {{- with ((.Values.global.dbClient.postgresql).pool).maxConnections }}
+      postgresql:
+        pool:
+          max_connections: {{ . }}
+      {{- end }}
 
     {{- if .Values.processor.config.progressUpdateInterval }}
     progress_update_interval: {{ .Values.processor.config.progressUpdateInterval | quote }}
