@@ -123,6 +123,20 @@ The endpoint remains batch-scoped: every request URL in the input JSONL must exa
 | `processor.config.resumable.finalizeConcurrency` | `16` | Bounds the parallel result-object fetches during resumable finalization. |
 | `processor.config.resumable.finalizeTimeout` | `"30m"` | Budget for one resumable finalization attempt. |
 
+### PostgreSQL connection pools
+
+`global.dbClient.postgresql.pool.maxConnections` caps each pgx pool, not their
+total. `0` (the default) keeps the DSN `pool_max_conns`, or else pgxpool's
+`max(4, CPUs)`. A value above `0` overrides the DSN. The effective minimum is 2,
+because LISTEN holds a connection, so count a cap of 1 as 2.
+
+Each apiserver and gc replica opens 4 pools; each processor replica opens 5. Budget:
+
+`sum(pools × max_connections) × replicas + other clients < PostgreSQL max_connections`
+
+Other clients include the async SQL pool (`asyncDispatch.maxConnections`) and
+the llm-d-async dispatcher.
+
 ### Async inference queue transport
 
 Set `processor.config.dispatchMode` to `async` and choose the queue transport

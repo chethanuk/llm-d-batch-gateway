@@ -40,6 +40,12 @@ global:
   dbClient:
     # Database backend type: "postgresql".
     type: "postgresql"
+    postgresql:
+      pool:
+        # Connection cap for each pgx pool: apiserver and gc open 4 pools, the processor 5.
+        # 0 keeps the pgxpool default, max(4, CPUs). Values below 2 are raised to 2 for LISTEN.
+        # Budget it against PostgreSQL max_connections; see README.md.
+        maxConnections: 0
 
   # OpenTelemetry configuration
   otel:
